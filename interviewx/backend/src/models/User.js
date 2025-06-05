@@ -1,6 +1,6 @@
-// backend/src/models/User.js
-const mongoose = require('mongoose');
-const bcrypt = require('bcryptjs');
+// backend/src/models/User.js - ES Modules Version
+import mongoose from 'mongoose';
+import bcrypt from 'bcryptjs';
 
 const userSchema = new mongoose.Schema({
   // Basic Information
@@ -589,4 +589,4 @@ userSchema.statics.createAdmin = async function(userData) {
   return admin;
 };
 
-module.exports = mongoose.model('User', userSchema);
+export default mongoose.model('User', userSchema);

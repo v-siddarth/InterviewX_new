@@ -7,6 +7,11 @@ import compression from 'compression';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 import dotenv from 'dotenv';
+import bcrypt from 'bcryptjs';
+import fetch from 'node-fetch';
+
+// Import User model (ES modules)
+import User from './models/User.js';
 
 // Load environment variables
 dotenv.config();
@@ -47,6 +52,7 @@ const config = {
   UPLOAD_PATH: process.env.UPLOAD_PATH || './uploads',
   RATE_LIMIT_WINDOW: process.env.RATE_LIMIT_WINDOW || 15 * 60 * 1000,
   RATE_LIMIT_MAX: process.env.RATE_LIMIT_MAX || 100,
+  GEMINI_API_KEY: process.env.GEMINI_API_KEY || 'YOUR_GEMINI_API_KEY_HERE',
 };
 
 // Initialize Express app
@@ -110,62 +116,14 @@ app.get('/health', (req, res) => {
     status: 'OK',
     timestamp: new Date().toISOString(),
     service: 'InterviewX Backend',
-    version: '1.0.0'
+    version: '1.0.0',
+    environment: config.NODE_ENV,
+    database: mongoose.connection.readyState === 1 ? 'Connected' : 'Disconnected'
   });
 });
 
-// Mock data with proper field names and admin user
-const users = [
-  {
-    _id: '1',
-    firstName: 'Demo',
-    lastName: 'User',
-    email: 'demo@interviewx.com',
-    password: '$2a$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewqmtYEOxfOqlPAK', // demo123
-    role: 'candidate',
-    isActive: true,
-    createdAt: new Date().toISOString(),
-    lastLogin: new Date(Date.now() - 86400000).toISOString(),
-    stats: {
-      totalInterviews: 5,
-      completedInterviews: 3,
-      averageScore: 82
-    }
-  },
-  {
-    _id: '2',
-    firstName: 'Admin',
-    lastName: 'User',
-    email: 'admin@interviewx.com',
-    password: '$2a$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewqmtYEOxfOqlPAK', // admin123
-    role: 'admin',
-    isActive: true,
-    createdAt: new Date(Date.now() - 86400000 * 30).toISOString(),
-    lastLogin: new Date().toISOString(),
-    stats: {
-      totalInterviews: 0,
-      completedInterviews: 0,
-      averageScore: 0
-    }
-  },
-  {
-    _id: '3',
-    firstName: 'Sarah',
-    lastName: 'Johnson',
-    email: 'sarah@example.com',
-    password: '$2a$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewqmtYEOxfOqlPAK',
-    role: 'candidate',
-    isActive: true,
-    createdAt: new Date(Date.now() - 86400000 * 5).toISOString(),
-    lastLogin: new Date(Date.now() - 172800000).toISOString(),
-    stats: {
-      totalInterviews: 2,
-      completedInterviews: 1,
-      averageScore: 76
-    }
-  }
-];
 
+// Mock data for interviews and questions (since models don't exist yet)
 const interviews = [
   {
     _id: '1',
@@ -225,18 +183,12 @@ const questions = [
   }
 ];
 
-// Helper function to generate initials for avatar
-const generateInitials = (firstName, lastName) => {
-  return `${firstName.charAt(0)}${lastName.charAt(0)}`.toUpperCase();
-};
-
 // Helper function to create fallback avatar
 const createFallbackAvatar = (firstName, lastName) => {
-  const initials = generateInitials(firstName, lastName);
+  const initials = `${firstName.charAt(0)}${lastName.charAt(0)}`.toUpperCase();
   const colors = ['3B82F6', 'EF4444', '10B981', 'F59E0B', '8B5CF6', 'EC4899'];
   const color = colors[Math.floor(Math.random() * colors.length)];
   
-  // Create a data URI for the avatar instead of external URL
   return `data:image/svg+xml;base64,${btoa(`
     <svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
       <rect width="100" height="100" fill="#${color}"/>
@@ -251,7 +203,7 @@ const requireAuth = (req, res, next) => {
   if (!token) {
     return res.status(401).json({ message: 'No token provided' });
   }
-  // In a real app, verify JWT token here
+  // In production, you'd verify the JWT token here
   next();
 };
 
@@ -261,117 +213,741 @@ const requireAdmin = (req, res, next) => {
   if (!token) {
     return res.status(401).json({ message: 'No token provided' });
   }
-  // In a real app, verify JWT token and check role here
-  // For now, just pass through
   next();
 };
 
-// Auth Routes
-app.post('/api/auth/login', asyncHandler(async (req, res) => {
-  const { email, password } = req.body;
-  
-  const user = users.find(u => u.email === email);
-  
-  if ((email === 'demo@interviewx.com' && password === 'demo123') ||
-      (email === 'admin@interviewx.com' && password === 'admin123')) {
-    
-    const token = 'mock-jwt-token';
-    
-    res.json({
-      message: 'Login successful',
-      token,
-      user: {
-        _id: user._id,
-        firstName: user.firstName,
-        lastName: user.lastName,
-        email: user.email,
-        avatar: createFallbackAvatar(user.firstName, user.lastName),
-        role: user.role,
-        stats: user.stats
+// NEW: Gemini Question Generation Service
+class BackendGeminiService {
+  constructor() {
+    this.apiKey = config.GEMINI_API_KEY;
+    this.baseUrl = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent';
+  }
+
+  async generateQuestions(interviewType, difficulty = 'medium', duration = 30, count = null) {
+    try {
+      logger.info(`🤖 Generating ${interviewType} questions with Gemini AI...`);
+      
+      const questionCount = count || Math.max(3, Math.floor(duration / (interviewType === 'coding' ? 15 : 5)));
+      
+      const prompt = this.createQuestionPrompt(interviewType, difficulty, duration, questionCount);
+      
+      const response = await fetch(`${this.baseUrl}?key=${this.apiKey}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          contents: [{
+            parts: [{
+              text: prompt
+            }]
+          }],
+          generationConfig: {
+            temperature: 0.7,
+            topK: 40,
+            topP: 0.8,
+            maxOutputTokens: 2000,
+          }
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`Gemini API error: ${response.status}`);
       }
-    });
-  } else {
-    res.status(400).json({ message: 'Invalid credentials' });
-  }
-}));
 
-app.post('/api/auth/register', asyncHandler(async (req, res) => {
-  const { firstName, lastName, email, password } = req.body;
-  
-  // Check if user already exists
-  const existingUser = users.find(u => u.email === email);
-  if (existingUser) {
-    return res.status(400).json({ message: 'User already exists with this email' });
+      const data = await response.json();
+      const questionsText = data.candidates[0].content.parts[0].text;
+      
+      return this.parseQuestions(questionsText, interviewType);
+      
+    } catch (error) {
+      logger.error('❌ Error generating questions:', error);
+      return this.getFallbackQuestions(interviewType, difficulty, duration);
+    }
   }
-  
-  const newUser = {
-    _id: Date.now().toString(),
-    firstName,
-    lastName,
-    email,
-    password: 'hashed-password',
-    role: 'candidate',
-    isActive: true,
-    createdAt: new Date().toISOString(),
-    lastLogin: null,
-    stats: {
-      totalInterviews: 0,
-      completedInterviews: 0,
-      averageScore: 0
-    }
-  };
-  
-  users.push(newUser);
-  
-  res.status(201).json({
-    message: 'User created successfully',
-    token: 'mock-jwt-token-new',
-    user: {
-      _id: newUser._id,
-      firstName: newUser.firstName,
-      lastName: newUser.lastName,
-      email: newUser.email,
-      avatar: createFallbackAvatar(newUser.firstName, newUser.lastName),
-      role: newUser.role,
-      stats: newUser.stats
-    }
-  });
-}));
 
-// Profile Routes (existing)
-app.get('/api/profile', requireAuth, (req, res) => {
-  const user = users[0]; // Mock current user
-  res.json({
-    user: {
+  createQuestionPrompt(interviewType, difficulty, duration, questionCount) {
+    let typeGuidelines = '';
+    
+    switch (interviewType) {
+      case 'technical':
+        typeGuidelines = `
+- Programming concepts, algorithms, system design
+- Specific technologies (JavaScript, React, Node.js, Python)
+- Debugging, optimization, best practices
+- Scenario-based technical problems`;
+        break;
+        
+      case 'behavioral':
+        typeGuidelines = `
+- Past experiences, teamwork, leadership
+- STAR method questions (Situation, Task, Action, Result)
+- Conflict resolution, decision-making
+- Career goals and motivation`;
+        break;
+        
+      case 'coding':
+        typeGuidelines = `
+- Algorithmic problems and data structures
+- Array manipulation, string processing, tree/graph problems
+- Time/space complexity analysis
+- Practical coding scenarios`;
+        break;
+        
+      case 'system-design':
+        typeGuidelines = `
+- Scalable system architecture
+- Database design, API design, microservices
+- Load balancing, caching, security
+- Real-world system examples`;
+        break;
+    }
+
+    return `Generate ${questionCount} high-quality ${interviewType} interview questions.
+
+REQUIREMENTS:
+- Type: ${interviewType}
+- Difficulty: ${difficulty}
+- Duration: ${duration} minutes
+- Count: ${questionCount}
+
+GUIDELINES:
+${typeGuidelines}
+
+DIFFICULTY LEVELS:
+- Easy: Basic concepts, entry-level
+- Medium: Intermediate concepts, moderate complexity
+- Hard: Advanced concepts, complex scenarios
+
+Return ONLY valid JSON in this format:
+{
+  "questions": [
+    {
+      "id": 1,
+      "text": "Question text here",
+      "type": "${interviewType}",
+      "timeLimit": 300,
+      "difficulty": "${difficulty}",
+      "category": "Category name",
+      "allowVideo": true,
+      "allowAudio": true,
+      "allowText": true,
+      "hints": ["Optional hint"],
+      "expectedPoints": ["Expected answer point 1", "Expected answer point 2"]
+    }
+  ]
+}`;
+  }
+
+  parseQuestions(questionsText, interviewType) {
+    try {
+      const cleanedText = questionsText
+        .replace(/```json/g, '')
+        .replace(/```/g, '')
+        .trim();
+      
+      const parsed = JSON.parse(cleanedText);
+      
+      if (!parsed.questions || !Array.isArray(parsed.questions)) {
+        throw new Error('Invalid format');
+      }
+      
+      return parsed.questions.map((q, index) => ({
+        id: q.id || (index + 1),
+        text: q.text || 'Sample question',
+        type: q.type || interviewType,
+        timeLimit: Math.max(120, Math.min(1800, q.timeLimit || 300)),
+        difficulty: q.difficulty || 'medium',
+        category: q.category || 'General',
+        allowVideo: q.allowVideo !== false,
+        allowAudio: q.allowAudio !== false,
+        allowText: q.allowText !== false,
+        hints: q.hints || [],
+        expectedPoints: q.expectedPoints || []
+      }));
+      
+    } catch (error) {
+      logger.error('❌ Error parsing questions:', error);
+      return this.getFallbackQuestions(interviewType, 'medium', 30);
+    }
+  }
+
+  getFallbackQuestions(interviewType, difficulty, duration) {
+    const fallbackBanks = {
+      technical: [
+        {
+          id: 1,
+          text: "Tell me about yourself and your background in technology.",
+          type: "technical",
+          timeLimit: 300,
+          difficulty: "easy",
+          category: "Introduction",
+          allowVideo: true,
+          allowAudio: true,
+          allowText: true,
+          hints: [],
+          expectedPoints: ["Background", "Experience", "Skills"]
+        },
+        {
+          id: 2,
+          text: "Explain the difference between let, const, and var in JavaScript.",
+          type: "technical",
+          timeLimit: 240,
+          difficulty: "medium",
+          category: "JavaScript",
+          allowVideo: true,
+          allowAudio: true,
+          allowText: true,
+          hints: ["Think about scope", "Consider hoisting"],
+          expectedPoints: ["Scope differences", "Hoisting behavior", "Reassignment rules"]
+        },
+        {
+          id: 3,
+          text: "What is closure and how does it work in JavaScript?",
+          type: "technical",
+          timeLimit: 300,
+          difficulty: "medium",
+          category: "JavaScript",
+          allowVideo: true,
+          allowAudio: true,
+          allowText: true,
+          hints: ["Inner function accessing outer variables"],
+          expectedPoints: ["Definition", "Lexical scoping", "Practical example"]
+        }
+      ],
+      behavioral: [
+        {
+          id: 1,
+          text: "Tell me about yourself and your professional background.",
+          type: "behavioral",
+          timeLimit: 300,
+          difficulty: "easy",
+          category: "Introduction",
+          allowVideo: true,
+          allowAudio: true,
+          allowText: true,
+          hints: [],
+          expectedPoints: ["Background", "Experience", "Goals"]
+        },
+        {
+          id: 2,
+          text: "Describe a challenging project you worked on and how you overcame obstacles.",
+          type: "behavioral",
+          timeLimit: 360,
+          difficulty: "medium",
+          category: "Problem Solving",
+          allowVideo: true,
+          allowAudio: true,
+          allowText: true,
+          hints: ["Use STAR method"],
+          expectedPoints: ["Situation", "Task", "Action", "Result"]
+        }
+      ],
+      coding: [
+        {
+          id: 1,
+          text: "Implement a function to reverse a string without using built-in methods.",
+          type: "coding",
+          timeLimit: 600,
+          difficulty: "easy",
+          category: "String Manipulation",
+          allowVideo: true,
+          allowAudio: true,
+          allowText: true,
+          hints: ["Use two pointers", "Consider character swapping"],
+          expectedPoints: ["Algorithm approach", "Time complexity", "Working code"]
+        }
+      ],
+      'system-design': [
+        {
+          id: 1,
+          text: "Design a URL shortener service like bit.ly.",
+          type: "system-design",
+          timeLimit: 1200,
+          difficulty: "medium",
+          category: "Web Services",
+          allowVideo: true,
+          allowAudio: true,
+          allowText: true,
+          hints: ["Think about URL encoding", "Consider database design"],
+          expectedPoints: ["System architecture", "Database design", "Scalability"]
+        }
+      ]
+    };
+    
+    const selectedQuestions = fallbackBanks[interviewType] || fallbackBanks.technical;
+    const questionCount = Math.min(selectedQuestions.length, Math.max(1, Math.floor(duration / 5)));
+    
+    return selectedQuestions.slice(0, questionCount);
+  }
+}
+
+// Initialize Gemini service
+const geminiService = new BackendGeminiService();
+
+// Auth Routes - REAL DATABASE VERSION
+app.post('/api/auth/login', asyncHandler(async (req, res) => {
+  try {
+    logger.info('🔐 Login attempt received:', { email: req.body.email });
+    
+    const { email, password } = req.body;
+    
+    // Validate input
+    if (!email || !password) {
+      logger.warn('❌ Login failed: Missing email or password');
+      return res.status(400).json({ 
+        message: 'Email and password are required' 
+      });
+    }
+
+    // Use the static method from User model
+    const user = await User.findByCredentials(email, password);
+    
+    if (!user) {
+      logger.warn('❌ Login failed: Invalid credentials for email:', email);
+      return res.status(400).json({ 
+        message: 'Invalid email or password' 
+      });
+    }
+
+    logger.info('✅ User found and authenticated:', { email: user.email, role: user.role });
+
+    // Record login
+    const ip = req.ip || req.connection.remoteAddress;
+    const userAgent = req.get('User-Agent');
+    await user.recordLogin(ip, userAgent, true);
+
+    // Generate token (mock for now)
+    const token = `mock-jwt-token-${user._id}-${Date.now()}`;
+    
+    // Prepare user response
+    const userResponse = {
       _id: user._id,
       firstName: user.firstName,
       lastName: user.lastName,
       email: user.email,
-      avatar: createFallbackAvatar(user.firstName, user.lastName),
+      avatar: user.profileImage || createFallbackAvatar(user.firstName, user.lastName),
       role: user.role,
-      stats: user.stats,
-      phone: '',
-      location: '',
-      jobTitle: '',
-      skills: [],
-      education: '',
-      about: '',
-      profileImage: null,
-      resumeUrl: null
+      stats: {
+        totalInterviews: user.totalInterviews || 0,
+        completedInterviews: user.completedInterviews || 0,
+        averageScore: user.averageScore || 0
+      },
+      lastLogin: user.lastLogin,
+      createdAt: user.createdAt
+    };
+    
+    logger.info(`✅ User logged in successfully: ${user.email}`);
+    
+    res.json({
+      message: 'Login successful',
+      token,
+      user: userResponse
+    });
+    
+  } catch (error) {
+    logger.error('❌ Login error:', error.message);
+    
+    // Handle specific errors from User.findByCredentials
+    if (error.message.includes('Invalid login credentials')) {
+      return res.status(400).json({ message: 'Invalid email or password' });
     }
-  });
+    if (error.message.includes('Account is temporarily locked')) {
+      return res.status(429).json({ message: 'Account is temporarily locked. Please try again later.' });
+    }
+    if (error.message.includes('Account is deactivated')) {
+      return res.status(403).json({ message: 'Account is deactivated. Please contact support.' });
+    }
+    
+    res.status(500).json({ 
+      message: 'Internal server error during login' 
+    });
+  }
+}));
+
+app.post('/api/auth/register', asyncHandler(async (req, res) => {
+  try {
+    logger.info('📝 Registration attempt received:', { 
+      firstName: req.body.firstName, 
+      lastName: req.body.lastName,
+      email: req.body.email 
+    });
+    
+    const { firstName, lastName, email, password } = req.body;
+    
+    // Validate input
+    if (!firstName || !lastName || !email || !password) {
+      logger.warn('❌ Registration failed: Missing required fields');
+      return res.status(400).json({ 
+        message: 'All fields are required' 
+      });
+    }
+    
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      logger.warn('❌ Registration failed: Invalid email format:', email);
+      return res.status(400).json({ 
+        message: 'Please enter a valid email address' 
+      });
+    }
+    
+    // Validate password length
+    if (password.length < 6) {
+      logger.warn('❌ Registration failed: Password too short');
+      return res.status(400).json({ 
+        message: 'Password must be at least 6 characters long' 
+      });
+    }
+    
+    // Check if user already exists
+    const existingUser = await User.findOne({ email: email.toLowerCase() });
+    if (existingUser) {
+      logger.warn('❌ Registration failed: User already exists:', email);
+      return res.status(400).json({ 
+        message: 'User already exists with this email address' 
+      });
+    }
+    
+    // Create new user (password will be hashed by pre-save middleware)
+    const userData = {
+      firstName: firstName.trim(),
+      lastName: lastName.trim(),
+      email: email.toLowerCase().trim(),
+      password,
+      role: 'candidate',
+      isActive: true,
+      status: 'active'
+    };
+    
+    const newUser = new User(userData);
+    await newUser.save();
+    
+    // Generate token (mock)
+    const token = `mock-jwt-token-${newUser._id}-${Date.now()}`;
+    
+    // Record initial login
+    const ip = req.ip || req.connection.remoteAddress;
+    const userAgent = req.get('User-Agent');
+    await newUser.recordLogin(ip, userAgent, true);
+    
+    // Prepare user response
+    const userResponse = {
+      _id: newUser._id,
+      firstName: newUser.firstName,
+      lastName: newUser.lastName,
+      email: newUser.email,
+      avatar: newUser.profileImage || createFallbackAvatar(newUser.firstName, newUser.lastName),
+      role: newUser.role,
+      stats: {
+        totalInterviews: newUser.totalInterviews || 0,
+        completedInterviews: newUser.completedInterviews || 0,
+        averageScore: newUser.averageScore || 0
+      },
+      lastLogin: newUser.lastLogin,
+      createdAt: newUser.createdAt
+    };
+    
+    logger.info(`✅ New user registered successfully: ${newUser.email}`);
+    logger.info(`📊 User saved to MongoDB with ID: ${newUser._id}`);
+    
+    res.status(201).json({
+      message: 'User registered successfully',
+      token,
+      user: userResponse
+    });
+    
+  } catch (error) {
+    logger.error('❌ Registration error:', error);
+    
+    // Handle duplicate key error
+    if (error.code === 11000) {
+      return res.status(400).json({ 
+        message: 'User already exists with this email address' 
+      });
+    }
+    
+    // Handle validation errors
+    if (error.name === 'ValidationError') {
+      const messages = Object.values(error.errors).map(e => e.message);
+      return res.status(400).json({ 
+        message: messages.join(', ') 
+      });
+    }
+    
+    res.status(500).json({ 
+      message: 'Internal server error during registration' 
+    });
+  }
+}));
+
+// Profile Routes
+app.get('/api/profile', requireAuth, asyncHandler(async (req, res) => {
+  try {
+    // In production, get user ID from JWT token
+    // For now, we'll use the first candidate user
+    const user = await User.findOne({ role: 'candidate' }).sort({ createdAt: -1 });
+    
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    
+    const userResponse = {
+      _id: user._id,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      email: user.email,
+      avatar: user.profileImage || createFallbackAvatar(user.firstName, user.lastName),
+      role: user.role,
+      stats: {
+        totalInterviews: user.totalInterviews || 0,
+        completedInterviews: user.completedInterviews || 0,
+        averageScore: user.averageScore || 0
+      },
+      phone: user.phone || '',
+      location: user.location || '',
+      jobTitle: user.jobTitle || '',
+      skills: user.skills || [],
+      education: user.education || '',
+      about: user.about || '',
+      profileImage: user.profileImage || null,
+      resumeUrl: user.resumeUrl || null,
+      resumeFileName: user.resumeFileName || null,
+      lastLogin: user.lastLogin,
+      createdAt: user.createdAt
+    };
+    
+    res.json({
+      user: userResponse
+    });
+  } catch (error) {
+    logger.error('Get profile error:', error);
+    res.status(500).json({ 
+      message: 'Error fetching profile' 
+    });
+  }
+}));
+
+app.put('/api/profile', requireAuth, asyncHandler(async (req, res) => {
+  try {
+    const updates = req.body;
+    
+    // Find user to update (in real app, use req.user.id from JWT)
+    const user = await User.findOne({ role: 'candidate' }).sort({ createdAt: -1 });
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    
+    // Update user data
+    Object.assign(user, updates);
+    await user.save();
+    
+    const userResponse = {
+      _id: user._id,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      email: user.email,
+      avatar: user.profileImage || createFallbackAvatar(user.firstName, user.lastName),
+      role: user.role,
+      stats: {
+        totalInterviews: user.totalInterviews || 0,
+        completedInterviews: user.completedInterviews || 0,
+        averageScore: user.averageScore || 0
+      },
+      phone: user.phone || '',
+      location: user.location || '',
+      jobTitle: user.jobTitle || '',
+      skills: user.skills || [],
+      education: user.education || '',
+      about: user.about || '',
+      profileImage: user.profileImage || null,
+      resumeUrl: user.resumeUrl || null,
+      lastLogin: user.lastLogin,
+      createdAt: user.createdAt
+    };
+    
+    logger.info(`Profile updated for user: ${user.email}`);
+    
+    res.json({
+      message: 'Profile updated successfully',
+      user: userResponse
+    });
+    
+  } catch (error) {
+    logger.error('Update profile error:', error);
+    res.status(500).json({ 
+      message: 'Error updating profile' 
+    });
+  }
+}));
+
+// NEW: Gemini AI Question Generation Routes
+app.post('/api/questions/generate', requireAuth, asyncHandler(async (req, res) => {
+  try {
+    logger.info('🎯 Generating questions:', req.body);
+    
+    const { 
+      type = 'technical', 
+      difficulty = 'medium', 
+      duration = 30,
+      count = null 
+    } = req.body;
+    
+    // Validate inputs
+    const validTypes = ['technical', 'behavioral', 'coding', 'system-design'];
+    const validDifficulties = ['easy', 'medium', 'hard'];
+    
+    if (!validTypes.includes(type)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid interview type'
+      });
+    }
+    
+    if (!validDifficulties.includes(difficulty)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid difficulty level'
+      });
+    }
+    
+    if (duration < 5 || duration > 120) {
+      return res.status(400).json({
+        success: false,
+        message: 'Duration must be between 5 and 120 minutes'
+      });
+    }
+    
+    // Generate questions
+    const questions = await geminiService.generateQuestions(type, difficulty, duration, count);
+    
+    logger.info(`✅ Generated ${questions.length} questions for ${type} interview`);
+    
+    res.json({
+      success: true,
+      message: 'Questions generated successfully',
+      questions,
+      metadata: {
+        type,
+        difficulty,
+        duration,
+        count: questions.length,
+        generatedBy: 'gemini-ai',
+        generatedAt: new Date().toISOString()
+      }
+    });
+    
+  } catch (error) {
+    logger.error('❌ Error generating questions:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to generate questions',
+      error: error.message
+    });
+  }
+}));
+
+app.get('/api/questions/types', requireAuth, (req, res) => {
+  try {
+    const questionTypes = [
+      {
+        value: 'technical',
+        label: 'Technical',
+        description: 'Programming concepts, algorithms, and technical skills',
+        duration: '15-45 minutes',
+        difficulty: ['easy', 'medium', 'hard']
+      },
+      {
+        value: 'behavioral',
+        label: 'Behavioral',
+        description: 'Past experiences, teamwork, and soft skills',
+        duration: '15-30 minutes',
+        difficulty: ['easy', 'medium', 'hard']
+      },
+      {
+        value: 'coding',
+        label: 'Coding',
+        description: 'Live coding challenges and algorithm problems',
+        duration: '30-60 minutes',
+        difficulty: ['easy', 'medium', 'hard']
+      },
+      {
+        value: 'system-design',
+        label: 'System Design',
+        description: 'Architecture design and scalability discussions',
+        duration: '45-60 minutes',
+        difficulty: ['medium', 'hard']
+      }
+    ];
+    
+    res.json({
+      success: true,
+      types: questionTypes,
+      difficulties: [
+        { value: 'easy', label: 'Easy', description: 'Entry-level questions' },
+        { value: 'medium', label: 'Medium', description: 'Intermediate-level questions' },
+        { value: 'hard', label: 'Hard', description: 'Advanced-level questions' }
+      ]
+    });
+  } catch (error) {
+    logger.error('❌ Error fetching question types:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch question types'
+    });
+  }
 });
 
-// Admin Routes
-// Dashboard
-app.get('/api/admin/dashboard/stats', requireAdmin, (req, res) => {
-  res.json({
-    totalUsers: users.length,
-    activeInterviews: interviews.filter(i => i.status === 'in-progress').length,
-    completedInterviews: interviews.filter(i => i.status === 'completed').length,
-    totalQuestions: questions.length,
-  });
-});
+app.post('/api/questions/preview', requireAuth, asyncHandler(async (req, res) => {
+  try {
+    const { type, difficulty, duration, count } = req.body;
+    
+    // Generate sample questions
+    const questions = await geminiService.generateQuestions(type, difficulty, duration, count);
+    
+    res.json({
+      success: true,
+      preview: questions.map(q => ({
+        text: q.text,
+        category: q.category,
+        difficulty: q.difficulty,
+        timeLimit: q.timeLimit,
+        type: q.type
+      })),
+      metadata: {
+        totalQuestions: questions.length,
+        estimatedDuration: questions.reduce((sum, q) => sum + q.timeLimit, 0),
+        type,
+        difficulty
+      }
+    });
+    
+  } catch (error) {
+    logger.error('❌ Error generating preview:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to generate preview'
+    });
+  }
+}));
+
+// Admin Routes - Using Real Database + Mock Data
+app.get('/api/admin/dashboard/stats', requireAdmin, asyncHandler(async (req, res) => {
+  try {
+    const userStats = await User.getAdminStats();
+    
+    res.json({
+      totalUsers: userStats.totalUsers,
+      activeInterviews: interviews.filter(i => i.status === 'in-progress').length,
+      completedInterviews: interviews.filter(i => i.status === 'completed').length,
+      totalQuestions: questions.length,
+      ...userStats
+    });
+  } catch (error) {
+    logger.error('Error fetching admin stats:', error);
+    res.status(500).json({ message: 'Error fetching admin statistics' });
+  }
+}));
 
 app.get('/api/admin/dashboard/activities', requireAdmin, (req, res) => {
   const activities = [
@@ -397,79 +973,120 @@ app.get('/api/admin/dashboard/activities', requireAdmin, (req, res) => {
   res.json(activities);
 });
 
-// User Management
-app.get('/api/admin/users', requireAdmin, (req, res) => {
-  const { page = 1, limit = 10 } = req.query;
-  
-  res.json({
-    users: users,
-    totalPages: 1,
-    currentPage: parseInt(page),
-    total: users.length
-  });
-});
-
-app.get('/api/admin/users/stats', requireAdmin, (req, res) => {
-  res.json({
-    totalUsers: users.length,
-    activeUsers: users.filter(u => u.isActive).length,
-    adminUsers: users.filter(u => u.role === 'admin').length,
-    newThisMonth: users.filter(u => {
-      const userDate = new Date(u.createdAt);
-      const monthAgo = new Date();
-      monthAgo.setMonth(monthAgo.getMonth() - 1);
-      return userDate > monthAgo;
-    }).length
-  });
-});
-
-app.put('/api/admin/users/:userId/role', requireAdmin, (req, res) => {
-  const { userId } = req.params;
-  const { role } = req.body;
-  
-  const user = users.find(u => u._id === userId);
-  if (!user) {
-    return res.status(404).json({ message: 'User not found' });
+// User Management - Real Database
+app.get('/api/admin/users', requireAdmin, asyncHandler(async (req, res) => {
+  try {
+    const { page = 1, limit = 10, search = '' } = req.query;
+    
+    const result = await User.searchUsers(search, {
+      page: parseInt(page),
+      limit: parseInt(limit),
+      sortBy: 'createdAt',
+      sortOrder: -1
+    });
+    
+    res.json(result);
+  } catch (error) {
+    logger.error('Error fetching users:', error);
+    res.status(500).json({ message: 'Error fetching users' });
   }
-  
-  user.role = role;
-  res.json({ message: 'User role updated successfully', user });
-});
+}));
 
-app.put('/api/admin/users/:userId/status', requireAdmin, (req, res) => {
-  const { userId } = req.params;
-  const { status } = req.body;
-  
-  const user = users.find(u => u._id === userId);
-  if (!user) {
-    return res.status(404).json({ message: 'User not found' });
+app.get('/api/admin/users/stats', requireAdmin, asyncHandler(async (req, res) => {
+  try {
+    const stats = await User.getAdminStats();
+    res.json(stats);
+  } catch (error) {
+    logger.error('Error fetching user stats:', error);
+    res.status(500).json({ message: 'Error fetching user statistics' });
   }
-  
-  user.isActive = status === 'active';
-  res.json({ message: 'User status updated successfully', user });
-});
+}));
 
-app.delete('/api/admin/users/:userId', requireAdmin, (req, res) => {
-  const { userId } = req.params;
-  const userIndex = users.findIndex(u => u._id === userId);
-  
-  if (userIndex === -1) {
-    return res.status(404).json({ message: 'User not found' });
+app.put('/api/admin/users/:userId/role', requireAdmin, asyncHandler(async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { role } = req.body;
+    
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    
+    user.role = role;
+    await user.save();
+    
+    res.json({ message: 'User role updated successfully', user });
+  } catch (error) {
+    logger.error('Error updating user role:', error);
+    res.status(500).json({ message: 'Error updating user role' });
   }
-  
-  users.splice(userIndex, 1);
-  res.json({ message: 'User deleted successfully' });
-});
+}));
 
-// Question Management
+app.put('/api/admin/users/:userId/status', requireAdmin, asyncHandler(async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { status } = req.body;
+    
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    
+    user.isActive = status === 'active';
+    user.status = status;
+    await user.save();
+    
+    res.json({ message: 'User status updated successfully', user });
+  } catch (error) {
+    logger.error('Error updating user status:', error);
+    res.status(500).json({ message: 'Error updating user status' });
+  }
+}));
+
+app.delete('/api/admin/users/:userId', requireAdmin, asyncHandler(async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    
+    await User.findByIdAndDelete(userId);
+    
+    res.json({ message: 'User deleted successfully' });
+  } catch (error) {
+    logger.error('Error deleting user:', error);
+    res.status(500).json({ message: 'Error deleting user' });
+  }
+}));
+
+// Question Management (Mock Data - since Question model doesn't exist yet)
 app.get('/api/admin/questions', requireAdmin, (req, res) => {
-  const { page = 1, limit = 20 } = req.query;
+  const { page = 1, limit = 20, search = '', category = '', difficulty = '' } = req.query;
+  
+  let filteredQuestions = questions;
+  
+  if (search) {
+    const searchLower = search.toLowerCase();
+    filteredQuestions = filteredQuestions.filter(q => 
+      q.text.toLowerCase().includes(searchLower)
+    );
+  }
+  
+  if (category) {
+    filteredQuestions = filteredQuestions.filter(q => q.category === category);
+  }
+  
+  if (difficulty) {
+    filteredQuestions = filteredQuestions.filter(q => q.difficulty === difficulty);
+  }
   
   res.json({
-    questions: questions,
-    totalPages: 1,
+    questions: filteredQuestions,
+    totalPages: Math.ceil(filteredQuestions.length / limit),
     currentPage: parseInt(page),
-    total: questions.length
+    total: filteredQuestions.length
   });
 });
 
@@ -509,6 +1126,27 @@ app.delete('/api/admin/questions/:questionId', requireAdmin, (req, res) => {
   res.json({ message: 'Question deleted successfully' });
 });
 
+app.get('/api/admin/questions/categories', requireAdmin, (req, res) => {
+  const categories = [
+    'Technical',
+    'Behavioral',
+    'Problem Solving',
+    'Communication',
+    'Leadership',
+    'JavaScript',
+    'React',
+    'Node.js',
+    'Python',
+    'Data Structures',
+    'Algorithms',
+    'System Design',
+    'Database',
+    'DevOps'
+  ];
+
+  res.json(categories);
+});
+
 app.post('/api/admin/questions/generate-set', requireAdmin, (req, res) => {
   const { count = 10, categories = [], difficulty = null } = req.body;
   
@@ -522,20 +1160,16 @@ app.post('/api/admin/questions/generate-set', requireAdmin, (req, res) => {
     filteredQuestions = filteredQuestions.filter(q => q.difficulty === difficulty);
   }
   
-  // Shuffle and take requested count
   const shuffled = filteredQuestions.sort(() => 0.5 - Math.random());
   const selectedQuestions = shuffled.slice(0, Math.min(count, shuffled.length));
   
   res.json(selectedQuestions);
 });
 
-// ============= NEW ADMIN ROUTES ADDED BELOW =============
-
-// Results Management Routes
+// Results Management Routes (Mock Data)
 app.get('/api/admin/results', requireAdmin, (req, res) => {
   const { page = 1, limit = 20, status, dateRange, search } = req.query;
   
-  // Mock results data
   const mockResults = [
     {
       _id: '1',
@@ -553,35 +1187,7 @@ app.get('/api/admin/results', requireAdmin, (req, res) => {
       completedAt: new Date(Date.now() - 86400000).toISOString(),
       passed: true,
       strengths: ['Technical knowledge', 'Communication', 'Problem solving'],
-      improvements: ['More specific examples', 'Confidence in answers'],
-      detailedAnalysis: {
-        facial: { confidence: 88, eyeContact: 92, posture: 85 },
-        audio: { clarity: 90, pace: 78, volume: 85 },
-        content: { relevance: 87, depth: 82, structure: 90 }
-      }
-    },
-    {
-      _id: '2',
-      interviewId: 'int_002',
-      userId: '3',
-      userName: 'Sarah Johnson',
-      userEmail: 'sarah@example.com',
-      interviewTitle: 'Backend Developer Position',
-      overallScore: 76,
-      faceConfidence: 82,
-      audioQuality: 85,
-      answerRelevance: 71,
-      status: 'completed',
-      duration: 2145,
-      completedAt: new Date(Date.now() - 172800000).toISOString(),
-      passed: true,
-      strengths: ['System design', 'Database knowledge'],
-      improvements: ['Communication clarity', 'Code optimization'],
-      detailedAnalysis: {
-        facial: { confidence: 82, eyeContact: 78, posture: 80 },
-        audio: { clarity: 85, pace: 82, volume: 88 },
-        content: { relevance: 71, depth: 75, structure: 85 }
-      }
+      improvements: ['More specific examples', 'Confidence in answers']
     }
   ];
 
@@ -613,53 +1219,8 @@ app.get('/api/admin/results/stats', requireAdmin, (req, res) => {
     totalResults: 156,
     averageScore: 84.2,
     passRate: 87,
-    avgDuration: 28 * 60 // in seconds
+    avgDuration: 28 * 60
   });
-});
-
-app.get('/api/admin/results/:resultId', requireAdmin, (req, res) => {
-  const { resultId } = req.params;
-  
-  // Mock detailed result
-  const mockResult = {
-    _id: resultId,
-    interviewId: 'int_001',
-    userId: '1',
-    userName: 'Demo User',
-    userEmail: 'demo@interviewx.com',
-    interviewTitle: 'Frontend Developer Assessment',
-    overallScore: 85,
-    faceConfidence: 88,
-    audioQuality: 90,
-    answerRelevance: 82,
-    status: 'completed',
-    duration: 1845,
-    completedAt: new Date(Date.now() - 86400000).toISOString(),
-    passed: true,
-    questions: [
-      {
-        id: 1,
-        text: 'Tell me about yourself',
-        answer: 'I am a frontend developer with 3 years of experience...',
-        score: 85,
-        timeSpent: 280
-      },
-      {
-        id: 2,
-        text: 'Explain React hooks',
-        answer: 'React hooks are functions that let you use state...',
-        score: 92,
-        timeSpent: 340
-      }
-    ],
-    detailedAnalysis: {
-      facial: { confidence: 88, eyeContact: 92, posture: 85, expressiveness: 80 },
-      audio: { clarity: 90, pace: 78, volume: 85, filler_words: 15 },
-      content: { relevance: 87, depth: 82, structure: 90, examples: 75 }
-    }
-  };
-
-  res.json(mockResult);
 });
 
 // System Settings Routes
@@ -691,14 +1252,6 @@ app.get('/api/admin/settings', requireAdmin, (req, res) => {
       textAnalysisUrl: config.TEXT_ANALYSIS_URL,
       geminiApiKey: '***********'
     },
-    email: {
-      smtpHost: 'smtp.gmail.com',
-      smtpPort: 587,
-      smtpUser: 'noreply@interviewx.com',
-      smtpPassword: '***********',
-      fromEmail: 'InterviewX <noreply@interviewx.com>',
-      enableNotifications: true
-    },
     security: {
       passwordMinLength: 8,
       requireSpecialChars: true,
@@ -706,12 +1259,6 @@ app.get('/api/admin/settings', requireAdmin, (req, res) => {
       maxLoginAttempts: 5,
       enableTwoFactor: false,
       maxFileSize: 10
-    },
-    backup: {
-      autoBackup: true,
-      backupFrequency: 'daily',
-      retentionDays: 30,
-      backupLocation: 'local'
     }
   };
 
@@ -721,7 +1268,6 @@ app.get('/api/admin/settings', requireAdmin, (req, res) => {
 app.put('/api/admin/settings', requireAdmin, (req, res) => {
   const updatedSettings = req.body;
   
-  // In a real app, save to database
   logger.info('Settings updated:', updatedSettings);
   
   res.json({
@@ -730,273 +1276,7 @@ app.put('/api/admin/settings', requireAdmin, (req, res) => {
   });
 });
 
-// Question Categories Route
-app.get('/api/admin/questions/categories', requireAdmin, (req, res) => {
-  const categories = [
-    'Technical',
-    'Behavioral',
-    'Problem Solving',
-    'Communication',
-    'Leadership',
-    'JavaScript',
-    'React',
-    'Node.js',
-    'Python',
-    'Data Structures',
-    'Algorithms',
-    'System Design',
-    'Database',
-    'DevOps'
-  ];
-
-  res.json(categories);
-});
-
-// Bulk question operations
-app.delete('/api/admin/questions/bulk', requireAdmin, (req, res) => {
-  const { questionIds } = req.body;
-  
-  questionIds.forEach(id => {
-    const index = questions.findIndex(q => q._id === id);
-    if (index !== -1) {
-      questions.splice(index, 1);
-    }
-  });
-
-  res.json({
-    message: `${questionIds.length} questions deleted successfully`
-  });
-});
-
-// Export routes
-app.get('/api/admin/questions/export', requireAdmin, (req, res) => {
-  const { format = 'csv' } = req.query;
-  
-  if (format === 'csv') {
-    let csv = 'ID,Text,Category,Difficulty,Type,Time Limit,Usage Count,Created At\n';
-    
-    questions.forEach(q => {
-      csv += `${q._id},"${q.text}",${q.category},${q.difficulty},${q.type},${q.timeLimit},${q.usageCount || 0},${q.createdAt}\n`;
-    });
-    
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', 'attachment; filename=questions.csv');
-    res.send(csv);
-  } else {
-    res.json(questions);
-  }
-});
-
-app.get('/api/admin/users/export', requireAdmin, (req, res) => {
-  const { format = 'csv' } = req.query;
-  
-  if (format === 'csv') {
-    let csv = 'ID,First Name,Last Name,Email,Role,Status,Created At,Last Login\n';
-    
-    users.forEach(u => {
-      csv += `${u._id},${u.firstName},${u.lastName},${u.email},${u.role},${u.isActive ? 'Active' : 'Inactive'},${u.createdAt},${u.lastLogin || 'Never'}\n`;
-    });
-    
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', 'attachment; filename=users.csv');
-    res.send(csv);
-  } else {
-    res.json(users);
-  }
-});
-
-app.get('/api/admin/results/export', requireAdmin, (req, res) => {
-  const { format = 'csv' } = req.query;
-  
-  const mockResults = [
-    {
-      _id: '1',
-      userName: 'Demo User',
-      userEmail: 'demo@interviewx.com',
-      interviewTitle: 'Frontend Developer Assessment',
-      overallScore: 85,
-      status: 'completed',
-      completedAt: new Date(Date.now() - 86400000).toISOString()
-    }
-  ];
-  
-  if (format === 'csv') {
-    let csv = 'ID,User Name,Email,Interview,Score,Status,Completed At\n';
-    
-    mockResults.forEach(r => {
-      csv += `${r._id},${r.userName},${r.userEmail},"${r.interviewTitle}",${r.overallScore},${r.status},${r.completedAt}\n`;
-    });
-    
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', 'attachment; filename=results.csv');
-    res.send(csv);
-  } else {
-    res.json(mockResults);
-  }
-});
-
-// Analytics routes
-app.get('/api/admin/analytics/performance', requireAdmin, (req, res) => {
-  const { timeframe = '30d' } = req.query;
-  
-  const mockAnalytics = {
-    timeframe,
-    totalInterviews: 245,
-    completedInterviews: 189,
-    averageScore: 84.2,
-    passRate: 87.3,
-    topCategories: [
-      { category: 'JavaScript', count: 45, avgScore: 86 },
-      { category: 'React', count: 38, avgScore: 82 },
-      { category: 'Node.js', count: 32, avgScore: 79 }
-    ],
-    scoreDistribution: [
-      { range: '0-20', count: 2 },
-      { range: '21-40', count: 8 },
-      { range: '41-60', count: 15 },
-      { range: '61-80', count: 67 },
-      { range: '81-100', count: 97 }
-    ],
-    dailyStats: Array.from({ length: 30 }, (_, i) => ({
-      date: new Date(Date.now() - i * 86400000).toISOString().split('T')[0],
-      interviews: Math.floor(Math.random() * 15) + 5,
-      avgScore: Math.floor(Math.random() * 20) + 75
-    })).reverse()
-  };
-
-  res.json(mockAnalytics);
-});
-
-// System health and logs
-app.get('/api/admin/system/logs', requireAdmin, (req, res) => {
-  const { page = 1, level = 'all' } = req.query;
-  
-  const mockLogs = [
-    {
-      timestamp: new Date().toISOString(),
-      level: 'info',
-      message: 'User login successful',
-      details: { userId: '1', ip: '192.168.1.1' }
-    },
-    {
-      timestamp: new Date(Date.now() - 300000).toISOString(),
-      level: 'warn',
-      message: 'High memory usage detected',
-      details: { usage: '85%' }
-    },
-    {
-      timestamp: new Date(Date.now() - 600000).toISOString(),
-      level: 'error',
-      message: 'Failed to connect to AI service',
-      details: { service: 'face-analysis', error: 'Connection timeout' }
-    }
-  ];
-
-  res.json({
-    logs: mockLogs,
-    totalPages: 1,
-    currentPage: parseInt(page),
-    total: mockLogs.length
-  });
-});
-
-// Backup routes
-app.post('/api/admin/backup/create', requireAdmin, asyncHandler(async (req, res) => {
-  // Simulate backup creation
-  await new Promise(resolve => setTimeout(resolve, 2000));
-  
-  const backupId = Date.now().toString();
-  
-  res.json({
-    message: 'Backup created successfully',
-    backupId,
-    filename: `backup_${backupId}.zip`,
-    size: '125MB',
-    createdAt: new Date().toISOString()
-  });
-}));
-
-app.get('/api/admin/backup/list', requireAdmin, (req, res) => {
-  const mockBackups = [
-    {
-      id: '1',
-      filename: 'backup_20240101.zip',
-      size: '125MB',
-      createdAt: new Date(Date.now() - 86400000).toISOString(),
-      type: 'auto'
-    },
-    {
-      id: '2',
-      filename: 'backup_20231231.zip',
-      size: '122MB',
-      createdAt: new Date(Date.now() - 172800000).toISOString(),
-      type: 'manual'
-    }
-  ];
-
-  res.json(mockBackups);
-});
-
-// Email template routes
-app.get('/api/admin/email-templates', requireAdmin, (req, res) => {
-  const mockTemplates = [
-    {
-      id: 'welcome',
-      name: 'Welcome Email',
-      subject: 'Welcome to InterviewX',
-      content: 'Welcome {{firstName}} to InterviewX platform...',
-      variables: ['firstName', 'lastName', 'email']
-    },
-    {
-      id: 'interview-reminder',
-      name: 'Interview Reminder',
-      subject: 'Interview Reminder - {{interviewTitle}}',
-      content: 'Hi {{firstName}}, this is a reminder for your upcoming interview...',
-      variables: ['firstName', 'interviewTitle', 'interviewDate']
-    }
-  ];
-
-  res.json(mockTemplates);
-});
-
-app.put('/api/admin/email-templates/:templateId', requireAdmin, (req, res) => {
-  const { templateId } = req.params;
-  const { subject, content } = req.body;
-  
-  res.json({
-    message: 'Email template updated successfully',
-    templateId,
-    subject,
-    content
-  });
-});
-
-app.post('/api/admin/email-templates/:templateId/test', requireAdmin, (req, res) => {
-  const { templateId } = req.params;
-  const { email } = req.body;
-  
-  // Simulate sending test email
-  setTimeout(() => {
-    res.json({
-      message: `Test email sent to ${email}`,
-      templateId
-    });
-  }, 1000);
-});
-
-// ============= END OF NEW ADMIN ROUTES =============
-
-// System Health
-app.get('/api/admin/system/health', requireAdmin, (req, res) => {
-  res.json({
-    apiServer: 'online',
-    database: 'connected',
-    aiServices: 'running',
-    storage: 85
-  });
-});
-
-// Keep existing routes...
+// Interview Routes (Mock Data)
 app.get('/api/interviews', requireAuth, (req, res) => {
   res.json({
     interviews,
@@ -1007,7 +1287,7 @@ app.get('/api/interviews', requireAuth, (req, res) => {
 });
 
 app.post('/api/interviews', requireAuth, asyncHandler(async (req, res) => {
-  const { title, type, duration } = req.body;
+  const { title, type, duration, questions: interviewQuestions } = req.body;
   
   const newInterview = {
     _id: Date.now().toString(),
@@ -1019,7 +1299,7 @@ app.post('/api/interviews', requireAuth, asyncHandler(async (req, res) => {
     score: null,
     createdAt: new Date().toISOString(),
     completedAt: null,
-    questions: [
+    questions: interviewQuestions || [
       { id: 1, text: 'Tell me about yourself', type: 'behavioral', timeLimit: 300 },
       { id: 2, text: 'Describe a challenging project', type: 'behavioral', timeLimit: 300 },
       { id: 3, text: 'Technical question about ' + type, type: 'technical', timeLimit: 240 }
@@ -1034,11 +1314,9 @@ app.post('/api/interviews', requireAuth, asyncHandler(async (req, res) => {
   });
 }));
 
-// Mock file upload endpoints
+// File upload endpoints (Mock)
 app.post('/api/profile/upload-image', requireAuth, (req, res) => {
   const imageUrl = `/uploads/profiles/profile-${Date.now()}.jpg`;
-  const user = users[0];
-  user.profileImage = imageUrl;
   
   res.json({
     message: 'Profile image uploaded successfully',
@@ -1048,9 +1326,6 @@ app.post('/api/profile/upload-image', requireAuth, (req, res) => {
 
 app.post('/api/profile/upload-resume', requireAuth, (req, res) => {
   const resumeUrl = `/uploads/resumes/resume-${Date.now()}.pdf`;
-  const user = users[0];
-  user.resumeUrl = resumeUrl;
-  user.resumeFileName = 'resume.pdf';
   
   res.json({
     message: 'Resume uploaded successfully',
@@ -1059,22 +1334,47 @@ app.post('/api/profile/upload-resume', requireAuth, (req, res) => {
   });
 });
 
+// Export routes
+app.get('/api/admin/users/export', requireAdmin, asyncHandler(async (req, res) => {
+  try {
+    const { format = 'csv' } = req.query;
+    const users = await User.find({}).select('-password -twoFactorSecret');
+    
+    if (format === 'csv') {
+      let csv = 'ID,First Name,Last Name,Email,Role,Status,Created At,Last Login\n';
+      
+      users.forEach(u => {
+        csv += `${u._id},${u.firstName},${u.lastName},${u.email},${u.role},${u.isActive ? 'Active' : 'Inactive'},${u.createdAt},${u.lastLogin || 'Never'}\n`;
+      });
+      
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', 'attachment; filename=users.csv');
+      res.send(csv);
+    } else {
+      res.json(users);
+    }
+  } catch (error) {
+    logger.error('Error exporting users:', error);
+    res.status(500).json({ message: 'Error exporting users' });
+  }
+}));
+
 // Socket.IO connection handling
 io.on('connection', (socket) => {
-  logger.info(`Client connected: ${socket.id}`);
+  logger.info(`📡 Client connected: ${socket.id}`);
   
   socket.on('join-interview', (interviewId) => {
     socket.join(`interview-${interviewId}`);
-    logger.info(`Client ${socket.id} joined interview ${interviewId}`);
+    logger.info(`🎯 Client ${socket.id} joined interview ${interviewId}`);
   });
   
   socket.on('leave-interview', (interviewId) => {
     socket.leave(`interview-${interviewId}`);
-    logger.info(`Client ${socket.id} left interview ${interviewId}`);
+    logger.info(`🚪 Client ${socket.id} left interview ${interviewId}`);
   });
   
   socket.on('disconnect', () => {
-    logger.info(`Client disconnected: ${socket.id}`);
+    logger.info(`📴 Client disconnected: ${socket.id}`);
   });
 });
 
@@ -1083,7 +1383,7 @@ app.set('io', io);
 
 // Error handling middleware
 app.use((err, req, res, next) => {
-  logger.error('Error:', err);
+  logger.error('❌ Unhandled error:', err);
 
   if (err.name === 'ValidationError') {
     const errors = Object.values(err.errors).map(e => e.message);
@@ -1111,13 +1411,31 @@ app.use('*', (req, res) => {
   res.status(404).json({ message: 'Route not found' });
 });
 
-// Database connection (optional)
+// Database connection
 const connectDB = async () => {
   try {
-    await mongoose.connect(config.MONGODB_URI);
-    logger.info('Connected to MongoDB');
+    await mongoose.connect(config.MONGODB_URI, {
+      useNewUrlParser: true,
+      useUnifiedTopology: true,
+    });
+    logger.info('🗄️ Connected to MongoDB Atlas');
+    logger.info(`📍 Database: ${mongoose.connection.db.databaseName}`);
+    
+    // Create default admin user if none exists
+    const adminExists = await User.findOne({ role: 'admin' });
+    if (!adminExists) {
+      const defaultAdmin = await User.createAdmin({
+        firstName: 'Admin',
+        lastName: 'User',
+        email: 'admin@interviewx.com',
+        password: 'admin123'
+      });
+      logger.info('👑 Default admin user created:', defaultAdmin.email);
+    }
+    
   } catch (error) {
-    logger.warn('MongoDB connection failed, using mock data:', error.message);
+    logger.error('❌ MongoDB connection failed:', error.message);
+    process.exit(1);
   }
 };
 
@@ -1132,7 +1450,9 @@ const startServer = async () => {
     logger.info(`🌍 Environment: ${config.NODE_ENV}`);
     logger.info(`📋 Health check: http://localhost:${PORT}/health`);
     logger.info(`👑 Admin login: admin@interviewx.com / admin123`);
-    logger.info(`👤 Demo login: demo@interviewx.com / demo123`);
+    logger.info(`👤 Register new users or login with existing accounts`);
+    logger.info(`🗄️ Database: MongoDB Atlas (Production)`);
+    logger.info(`🤖 Gemini AI: ${config.GEMINI_API_KEY !== 'YOUR_GEMINI_API_KEY_HERE' ? 'Configured' : 'Not Configured'}`);
   });
 };
 
